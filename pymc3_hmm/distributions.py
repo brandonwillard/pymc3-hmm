@@ -1,19 +1,15 @@
-from copy import copy
-
 import numpy as np
 import pymc3 as pm
 import theano
 import theano.tensor as tt
+from pymc3.distributions import _logp
 from pymc3.distributions.distribution import _DrawValuesContext, draw_values
-from pymc3.distributions.mixture import _conversion_map, all_discrete
+from pymc3.distributions.mixture import _conversion_map
 from theano.graph.op import get_test_value
+from theano.tensor.extra_ops import broadcast_shape, broadcast_to
+from theano.tensor.random.op import RandomVariable
 
-from pymc3_hmm.utils import (
-    broadcast_to,
-    tt_broadcast_arrays,
-    tt_expand_dims,
-    vsearchsorted,
-)
+from pymc3_hmm.utils import tt_expand_dims, vsearchsorted
 
 
 def distribution_subset_args(dist, shape, idx, point=None):
@@ -103,6 +99,65 @@ def get_and_check_comp_value(x):
         )
 
 
+class SwitchingRV(RandomVariable):
+    """TODO"""
+
+    name = "switching"
+    ndim_supp = 1
+    ndims_params = [1, 2]
+    dtype = "floatX"
+    # _print_name = ("switching", "\\operatorname{switching}")
+
+    @classmethod
+    def rng_fn(cls, states, comp_dists, size):
+        # What will `comp_dists` look like?  A ragged array, e.g.
+        # comp_dists = [1, np.array([2, 2, 2, 2, ...])]
+        # Probably this:
+        # comp_dists = np.array([[1, 1, 1, ...]
+        #                        [2, 2, 2, ...]])
+
+        # (states,) = draw_values([self.states], point=point, size=size)
+        #
+        # if size:
+        #     # `draw_values` will not honor the `size` parameter if its arguments
+        #     # don't contain random variables, so, when our `self.states` are
+        #     # constants, we have to broadcast `states` so that it matches `size +
+        #     # self.shape`.
+        #     # Unfortunately, this means that our sampler relies on
+        #     # `self.shape`, which is bad for other, arguable more important
+        #     # reasons (e.g. when this `Distribution`'s symbolic inputs change
+        #     # shape, we now have to manually update `Distribution.shape` so
+        #     # that the sampler is consistent)
+        #
+        #     states = np.broadcast_to(
+        #         states, tuple(np.atleast_1d(size)) + tuple(self.shape)
+        #     )
+
+        samples = np.empty(states.shape)
+
+        for i, dist in enumerate(comp_dists):
+            # We want to sample from only the parts of our component
+            # distributions that are active given the states.
+            # This is only really relevant when the component distributions
+            # change over the state space (e.g. Poisson means that change
+            # over time).
+            # We could always sample such components over the entire space
+            # (e.g. time), but, for spaces with large dimension, that would
+            # be extremely costly and wasteful.
+            i_idx = np.where(states == i)
+            i_size = len(i_idx[0])
+
+            # TODO: Update this...
+            if i_size > 0:
+                subset_args = distribution_subset_args(dist, states.shape, i_idx)
+                samples[i_idx] = dist.dist(*subset_args)
+
+        return samples
+
+
+switching_rv = SwitchingRV()
+
+
 class SwitchingProcess(pm.Distribution):
     """A distribution that models a switching process over arbitrary univariate mixtures and a state sequence.
 
@@ -110,7 +165,10 @@ class SwitchingProcess(pm.Distribution):
 
     """  # noqa: E501
 
-    def __init__(self, comp_dists, states, *args, **kwargs):
+    rv_op = switching_rv
+
+    @classmethod
+    def dist(cls, comp_dists, states, **kwargs):
         """Initialize a `SwitchingProcess` instance.
 
         Each `Distribution` object in `comp_dists` must have a
@@ -129,130 +187,29 @@ class SwitchingProcess(pm.Distribution):
             equal to the size of `comp_dists`.
 
         """
-        self.states = tt.as_tensor_variable(pm.intX(states))
+        states = tt.as_tensor_variable(pm.intX(states))
 
-        states_tv = get_test_value(self.states)
+        comp_dists_shape = broadcast_shape(*[d.shape for d in comp_dists])
+        comp_dists = tt.stack([broadcast_to(cd, comp_dists_shape) for cd in comp_dists])
 
-        bcast_comps = np.broadcast(
-            states_tv, *[get_and_check_comp_value(x) for x in comp_dists[:31]]
-        )
+        return super().dist([states, comp_dists], **kwargs)
 
-        self.comp_dists = []
-        for dist in comp_dists:
-            d = copy(dist)
-            d.shape = bcast_comps.shape
-            self.comp_dists.append(d)
 
-        # TODO: Not sure why we would allow users to set the shape if we're
-        # just going to compute it.
-        # shape = kwargs.pop("shape", bcast_comps.shape)
-        shape = bcast_comps.shape
+@_logp.register(SwitchingRV)
+def switching_logp(op, obs, states, comp_dists):
+    """Return the scalar Theano log-likelihood at a point."""
 
-        defaults = kwargs.pop("defaults", [])
+    obs_tt = tt.as_tensor_variable(obs)
 
-        if all_discrete(comp_dists):
-            default_dtype = _conversion_map[theano.config.floatX]
-        else:
-            default_dtype = theano.config.floatX
+    logp_val = tt.alloc(-np.inf, *obs.shape)
 
-            try:
-                bcast_means = tt_broadcast_arrays(
-                    *([self.states] + [d.mean for d in self.comp_dists])
-                )
-                self.mean = tt.choose(self.states, bcast_means)
+    for i, dist in enumerate(comp_dists):
+        i_mask = tt.eq(states, i)
+        obs_i = obs_tt[i_mask]
+        subset_dist = dist.dist(*distribution_subset_args(dist, obs.shape, i_mask))
+        logp_val = tt.set_subtensor(logp_val[i_mask], subset_dist.logp(obs_i))
 
-                if "mean" not in defaults:
-                    defaults.append("mean")
-
-            except (AttributeError, ValueError, IndexError):  # pragma: no cover
-                pass
-
-        dtype = kwargs.pop("dtype", default_dtype)
-
-        try:
-            bcast_modes = tt_broadcast_arrays(
-                *([self.states] + [d.mode for d in self.comp_dists])
-            )
-            self.mode = tt.choose(self.states, bcast_modes)
-
-            if "mode" not in defaults:
-                defaults.append("mode")
-
-        except (AttributeError, ValueError, IndexError):  # pragma: no cover
-            pass
-
-        super().__init__(shape=shape, dtype=dtype, defaults=defaults, **kwargs)
-
-    def logp(self, obs):
-        """Return the scalar Theano log-likelihood at a point."""
-
-        obs_tt = tt.as_tensor_variable(obs)
-
-        logp_val = tt.alloc(-np.inf, *obs.shape)
-
-        for i, dist in enumerate(self.comp_dists):
-            i_mask = tt.eq(self.states, i)
-            obs_i = obs_tt[i_mask]
-            subset_dist = dist.dist(*distribution_subset_args(dist, obs.shape, i_mask))
-            logp_val = tt.set_subtensor(logp_val[i_mask], subset_dist.logp(obs_i))
-
-        return logp_val
-
-    def random(self, point=None, size=None):
-        """Sample from this distribution conditional on a given set of values.
-
-        Parameters
-        ----------
-        point: dict, optional
-            Dict of variable values on which random values are to be
-            conditioned (uses default point if not specified).
-        size: int, optional
-            Desired size of random sample (returns one sample if not
-            specified).
-
-        Returns
-        -------
-        array
-        """
-        with _DrawValuesContext():
-
-            (states,) = draw_values([self.states], point=point, size=size)
-
-            if size:
-                # `draw_values` will not honor the `size` parameter if its arguments
-                # don't contain random variables, so, when our `self.states` are
-                # constants, we have to broadcast `states` so that it matches `size +
-                # self.shape`.
-                # Unfortunately, this means that our sampler relies on
-                # `self.shape`, which is bad for other, arguable more important
-                # reasons (e.g. when this `Distribution`'s symbolic inputs change
-                # shape, we now have to manually update `Distribution.shape` so
-                # that the sampler is consistent)
-
-                states = np.broadcast_to(
-                    states, tuple(np.atleast_1d(size)) + tuple(self.shape)
-                )
-
-            samples = np.empty(states.shape)
-
-            for i, dist in enumerate(self.comp_dists):
-                # We want to sample from only the parts of our component
-                # distributions that are active given the states.
-                # This is only really relevant when the component distributions
-                # change over the state space (e.g. Poisson means that change
-                # over time).
-                # We could always sample such components over the entire space
-                # (e.g. time), but, for spaces with large dimension, that would
-                # be extremely costly and wasteful.
-                i_idx = np.where(states == i)
-                i_size = len(i_idx[0])
-                if i_size > 0:
-                    subset_args = distribution_subset_args(
-                        dist, states.shape, i_idx, point=point
-                    )
-                    samples[i_idx] = dist.dist(*subset_args).random(point=point)
-
-        return samples
+    return logp_val
 
 
 class PoissonZeroProcess(SwitchingProcess):

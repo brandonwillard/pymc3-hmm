@@ -17,8 +17,8 @@ setup(
     install_requires=[
         "numpy>=1.18.1",
         "scipy>=1.4.0",
-        "pymc3>=3.11.0",
-        "theano-pymc>=1.1.0",
+        "pymc3>=4.0.0",
+        "theano-pymc>=1.1.2",
     ],
     tests_require=["pytest"],
     long_description=open("README.md").read() if exists("README.md") else "",
