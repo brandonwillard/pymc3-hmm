@@ -17,8 +17,11 @@ setup(
     install_requires=[
         "numpy>=1.18.1",
         "scipy>=1.4.0",
-        "pymc3>=4.0.0",
-        "aesara>=2.0.10",
+        # XXX TODO: These are temporary and only for testing.
+        # "pymc3>=4.0.0",
+        "pymc3 @ git+https://github.com/brandonwillard/pymc3.git@use-distinct-rngs#egg=pymc3-4.0.0",  # noqa: E501
+        # "aesara>=2.0.10",
+        "aesara @ git+https://github.com/pymc-devs/aesara.git@master#egg=aesara-2.1.0",
     ],
     tests_require=["pytest"],
     long_description=open("README.md").read() if exists("README.md") else "",
